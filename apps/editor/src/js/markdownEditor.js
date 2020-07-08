@@ -15,10 +15,11 @@ import {
   getMdStartLine,
   getMdEndLine,
   getMdStartCh,
-  getMdEndCh
+  getMdEndCh,
+  addChPos,
+  findClosestNode
 } from './utils/markdown';
 import { getMarkInfo } from './markTextHelper';
-import { toggleTaskStates, changeTextToTaskMarker } from './codemirror/tasklist';
 
 const keyMapper = KeyMapper.getSharedInstance();
 
@@ -36,9 +37,6 @@ const defaultToolbarState = {
   heading: false,
   table: false
 };
-
-const LIST_RX = /^[ \t]*([-*+]|[\d]+\.)\s/;
-const LIST_TEXT_RX = /^(\s{0,3})\[(\s*x\s*)?\]\s/i;
 
 function getToolbarStateType({ type, listData }) {
   if (type === 'list' || type === 'item') {
@@ -106,7 +104,15 @@ function isToolbarStateChanged(previousState, currentState) {
   return Object.keys(currentState).some(type => previousState[type] !== currentState[type]);
 }
 
+function getParagraphInListItemNode(mdNode) {
+  return findClosestNode(
+    mdNode,
+    node => node.type === 'paragraph' && node.parent && node.parent.type === 'item'
+  );
+}
+
 const ATTR_NAME_MARK = 'data-tui-mark';
+const TASK_MARKER_RX = /^\[(\s*)(x?)(\s*)\](?:\s+)/i;
 
 /**
  * Class MarkdownEditor
@@ -123,7 +129,7 @@ class MarkdownEditor extends CodeMirrorExt {
         Enter: 'newlineAndIndentContinueMarkdownList',
         Tab: 'indentOrderedList',
         'Shift-Tab': 'indentLessOrderedList',
-        'Shift-Ctrl-X': cm => toggleTaskStates(cm, this.toastMark)
+        'Shift-Ctrl-X': () => this._toggleTaskStates()
       },
       viewportMargin: options && options.height === 'auto' ? Infinity : 10
     });
@@ -163,7 +169,6 @@ class MarkdownEditor extends CodeMirrorExt {
 
     this.cm.on('beforeChange', (cm, ev) => {
       if (ev.origin === 'paste') {
-        this._changeTaskMarkerBeforePaste(ev);
         this.eventManager.emit('pasteBefore', {
           source: 'markdown',
           data: ev
@@ -172,9 +177,8 @@ class MarkdownEditor extends CodeMirrorExt {
     });
 
     this.cm.on('change', (cm, cmEvent) => {
-      this._refreshCodeMirrorMarks(cmEvent);
+      this._refreshCodeMirror(cmEvent);
       this._emitMarkdownEditorChangeEvent(cmEvent);
-      changeTextToTaskMarker(cm, this.toastMark);
     });
 
     this.cm.on('focus', () => {
@@ -293,30 +297,61 @@ class MarkdownEditor extends CodeMirrorExt {
     }
   }
 
-  _changeTaskMarkerBeforePaste(ev) {
-    const { from, to, text } = ev;
+  _changeTaskState(mdNode, line) {
+    const { listData, sourcepos } = mdNode;
+    const { task, checked, padding } = listData;
 
-    const changed = text.map(line => {
-      const list = LIST_RX.exec(line);
+    if (task) {
+      const stateChar = checked ? ' ' : 'x';
+      const [[, startCh]] = sourcepos;
+      const startPos = { line, ch: startCh + padding };
 
-      if (list) {
-        const [bullet] = list;
-        const originText = line.replace(bullet, '');
-        const replacedText = originText.replace(
-          LIST_TEXT_RX,
-          (match, padding, stateChar) => `${padding}[${stateChar ? stateChar.trim() : ' '}] `
-        );
-
-        return `${bullet}${replacedText}`;
-      }
-
-      return line;
-    });
-
-    ev.update(from, to, changed);
+      this.cm.replaceRange(stateChar, startPos, addChPos(startPos, 1));
+    }
   }
 
-  _refreshCodeMirrorMarks(e) {
+  _toggleTaskStates() {
+    const ranges = this.cm.listSelections();
+
+    ranges.forEach(range => {
+      const { anchor, head } = range;
+      const startLine = Math.min(anchor.line, head.line);
+      const endLine = Math.max(anchor.line, head.line);
+      let mdNode;
+
+      for (let index = startLine, len = endLine; index <= len; index += 1) {
+        mdNode = this.toastMark.findFirstNodeAtLine(index + 1);
+
+        if (mdNode.type === 'list' || mdNode.type === 'item') {
+          this._changeTaskState(mdNode, index);
+        }
+      }
+    });
+  }
+
+  _changeTextToTaskMarker(mdNode) {
+    const paraNode = getParagraphInListItemNode(mdNode);
+
+    if (paraNode && !paraNode.parent.listData.task) {
+      const { literal, sourcepos } = mdNode;
+      const matched = literal && literal.match(TASK_MARKER_RX);
+
+      if (matched) {
+        const [, startSpaces, stateChar, lastSpaces] = matched;
+        const spaces = startSpaces.length + lastSpaces.length;
+        const [[startLine, startCh]] = sourcepos;
+        const startPos = { line: startLine - 1, ch: startCh };
+
+        if (stateChar) {
+          this.cm.replaceRange(stateChar, startPos, addChPos(startPos, spaces ? spaces + 1 : 0));
+        } else if (!spaces) {
+          this.cm.replaceRange(' ', startPos, startPos);
+        }
+      }
+    }
+  }
+
+  _refreshCodeMirror(e) {
     const { from, to, text } = e;
     const changed = this.toastMark.editMarkdown(
       [from.line + 1, from.ch + 1],
@@ -330,7 +365,10 @@ class MarkdownEditor extends CodeMirrorExt {
       return;
     }
 
-    changed.forEach(editResult => this._markNodes(editResult));
+    changed.forEach(editResult => {
+      this._markNodes(editResult);
+      this._changeTaskMarker(editResult);
+    });
   }
 
   _markNodes(editResult) {
@@ -353,7 +391,6 @@ class MarkdownEditor extends CodeMirrorExt {
         }
       }
 
-      /* eslint-disable max-depth */
       for (const parent of nodes) {
         const walker = parent.walker();
         let event = walker.next();
@@ -361,13 +398,34 @@ class MarkdownEditor extends CodeMirrorExt {
         while (event) {
           const { node, entering } = event;
 
+          // eslint-disable-next-line max-depth
           if (entering) {
             this._markNode(node);
           }
           event = walker.next();
         }
       }
-      /* eslint-enable max-depth */
+    }
+  }
+
+  _changeTaskMarker(editResult) {
+    const { nodes } = editResult;
+
+    if (nodes.length) {
+      for (const parent of nodes) {
+        const walker = parent.walker();
+        let event = walker.next();
+
+        while (event) {
+          const { node, entering } = event;
+
+          // eslint-disable-next-line max-depth
+          if (entering && node.type === 'text') {
+            this._changeTextToTaskMarker(node);
+          }
+          event = walker.next();
+        }
+      }
     }
   }
 
